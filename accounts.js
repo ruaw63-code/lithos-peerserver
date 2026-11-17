@@ -10,6 +10,9 @@
      POST /api/recover/request {u}            envía un código de 6 dígitos al correo de la cuenta (si hay correo configurado)
      POST /api/recover/confirm {u,code,new}   cambia la contraseña con el código recibido por correo
      GET  /api/me                             correo (oculto) de la cuenta · POST /api/email {email} · POST /api/recoverycode {p}
+     POST /api/score {mode,score} (Bearer) · GET /api/top?mode=classic|castle|dungeon&u=usuario   clasificación
+     POST /api/redeem {code} (Bearer)       canjea un código creado por el administrador
+     POST /api/admin/code · GET /api/admin/codes · POST /api/admin/code/delete   (cabecera X-Admin-Key = variable ADMIN_KEY)
      GET  /api/ping
    Correo (opcional): variables BREVO_API_KEY y MAIL_FROM (remitente verificado en Brevo, plan gratis 300/día).
    Almacenamiento:
@@ -36,6 +39,9 @@ class FileStore {
     clearTimeout(this.t);
     this.t = setTimeout(() => { try { const tmp = this.file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(this.db)); fs.renameSync(tmp, this.file); } catch (e) { console.error('No se pudo guardar el archivo', e.message); } }, 250);
   }
+  async getK(k) { const v = this.db.k && this.db.k[k]; return v === undefined ? null : JSON.parse(JSON.stringify(v)); }
+  async setK(k, v) { (this.db.k = this.db.k || {})[k] = v; this.flush(); }
+  async delK(k) { if (this.db.k) delete this.db.k[k]; this.flush(); }
   get name() { return 'archivo (' + this.file + ')'; }
 }
 class UpstashStore {
@@ -46,6 +52,9 @@ class UpstashStore {
   }
   async get(u) { const v = await this.cmd(['GET', 'lithos:user:' + u]); return v ? JSON.parse(v) : null; }
   async set(u, rec) { await this.cmd(['SET', 'lithos:user:' + u, JSON.stringify(rec)]); }
+  async getK(k) { const v = await this.cmd(['GET', 'lithos:k:' + k]); return v ? JSON.parse(v) : null; }
+  async setK(k, v) { await this.cmd(['SET', 'lithos:k:' + k, JSON.stringify(v)]); }
+  async delK(k) { await this.cmd(['DEL', 'lithos:k:' + k]); }
   get name() { return 'Upstash Redis'; }
 }
 function makeStore() {
@@ -79,7 +88,7 @@ setInterval(() => { const n = Date.now(); for (const [k, a] of hits) if (!a.some
 
 function send(res, code, obj) {
   const b = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Lithos-User', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS', 'Access-Control-Max-Age': '86400' });
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': 'Authorization, Content-Type, X-Lithos-User, X-Admin-Key', 'Access-Control-Allow-Methods': 'GET, POST, PUT, OPTIONS', 'Access-Control-Max-Age': '86400' });
   res.end(b);
 }
 function readBody(req) {
@@ -174,6 +183,70 @@ async function route(req, res, url) {
     });
   }
 
+
+  /* ---------- clasificación ---------- */
+  const MODES = { classic: 5e7, castle: 5e7, dungeon: 1e8 };
+  if (p === '/api/score' && m === 'POST') {
+    const b = await readBody(req), a = await authed(req, b); if (!a) return send(res, 401, { err: 'Sesión no válida.' });
+    const mode = String(b.mode || ''), sc = Math.floor(+b.score);
+    if (!(mode in MODES) || !isFinite(sc) || sc < 0 || sc > MODES[mode]) return send(res, 400, { err: 'Puntuación inválida.' });
+    if (limited('sc|' + a.u, 40, 60e3)) return send(res, 429, { err: 'Demasiado rápido.' });
+    return withLock('lb:' + mode, async () => {
+      const lb = (await store.getK('lb:' + mode)) || {}, cur = lb[a.u];
+      if (!cur || sc > cur.s) { lb[a.u] = { s: sc, t: Date.now() }; const ks = Object.keys(lb); if (ks.length > 1000) { ks.sort((x, y) => lb[y].s - lb[x].s); ks.slice(1000).forEach(k => delete lb[k]); } await store.setK('lb:' + mode, lb); }
+      send(res, 200, { ok: 1, best: lb[a.u] ? lb[a.u].s : sc });
+    });
+  }
+  if (p === '/api/top' && m === 'GET') {
+    const mode = String(url.searchParams.get('mode') || ''), me = cleanUser(url.searchParams.get('u'));
+    if (!(mode in MODES)) return send(res, 400, { err: 'Modo inválido.' });
+    const lb = (await store.getK('lb:' + mode)) || {}, arr = Object.keys(lb).map(u => ({ u, s: lb[u].s, t: lb[u].t })).sort((x, y) => y.s - x.s || x.t - y.t);
+    arr.forEach((e, i) => { e.r = i + 1; });
+    const mi = me ? arr.find(e => e.u === me) : null;
+    return send(res, 200, { list: arr.slice(0, 50), total: arr.length, me: mi ? { r: mi.r, s: mi.s, up: mi.r > 1 ? arr[mi.r - 2].s : 0, up3: mi.r > 3 ? arr[2].s : 0 } : null, t: Date.now() });
+  }
+
+  /* ---------- códigos del administrador ---------- */
+  const isAdmin = () => { const k = process.env.ADMIN_KEY, h = String(req.headers['x-admin-key'] || ''); return !!k && k.length >= 8 && tEq(sha(h), sha(k)); };
+  if (p.startsWith('/api/admin/')) {
+    if (limited('adm|' + ip, 40, 600e3)) return send(res, 429, { err: 'Demasiados intentos.' });
+    if (!process.env.ADMIN_KEY) return send(res, 503, { err: 'Falta la variable ADMIN_KEY (mín. 8 caracteres) en Render.' });
+    if (!isAdmin()) return send(res, 401, { err: 'Clave de administrador incorrecta.' });
+    if (p === '/api/admin/code' && m === 'POST') {
+      const b = await readBody(req), rw = b.rewards;
+      if (!Array.isArray(rw) || !rw.length || rw.length > 40 || JSON.stringify(rw).length > 12000) return send(res, 400, { err: 'Recompensas inválidas (1 a 40).' });
+      let code = normCode(b.code); if (code && (code.length < 4 || code.length > 24)) return send(res, 400, { err: 'El código propio debe tener 4 a 24 letras/números.' });
+      if (!code) code = normCode(genCode());
+      return withLock('codes', async () => {
+        if (await store.getK('code:' + code)) return send(res, 409, { err: 'Ese código ya existe.' });
+        const rec = { r: rw, uses: Math.max(0, Math.min(1e6, b.uses | 0)), used: [], exp: b.days > 0 ? Date.now() + Math.min(3650, +b.days) * 864e5 : 0, note: String(b.note || '').slice(0, 80), made: Date.now() };
+        await store.setK('code:' + code, rec); const ix = (await store.getK('codes')) || []; ix.push(code); await store.setK('codes', ix);
+        send(res, 200, { code: code.length === 12 ? code.slice(0, 4) + '-' + code.slice(4, 8) + '-' + code.slice(8) : code });
+      });
+    }
+    if (p === '/api/admin/codes' && m === 'GET') {
+      const ix = (await store.getK('codes')) || [], out = [];
+      for (const c of ix.slice(-60).reverse()) { const r = await store.getK('code:' + c); if (r) out.push({ code: c, note: r.note, uses: r.uses, used: r.used.length, exp: r.exp, n: r.r.length }); }
+      return send(res, 200, { codes: out });
+    }
+    if (p === '/api/admin/code/delete' && m === 'POST') {
+      const b = await readBody(req), c = normCode(b.code);
+      return withLock('codes', async () => { await store.delK('code:' + c); const ix = ((await store.getK('codes')) || []).filter(x => x !== c); await store.setK('codes', ix); send(res, 200, { ok: 1 }); });
+    }
+    return send(res, 404, { err: 'No existe' });
+  }
+  if (p === '/api/redeem' && m === 'POST') {
+    const b = await readBody(req), a = await authed(req, b); if (!a) return send(res, 401, { err: 'Inicia sesión para canjear códigos.' });
+    const c = normCode(b.code); if (c.length < 4) return send(res, 400, { err: 'Escribe el código.' });
+    if (limited('rd|' + a.u, 12, 600e3) || limited('rdi|' + ip, 30, 600e3)) return send(res, 429, { err: 'Demasiados intentos. Espera unos minutos.' });
+    return withLock('code:' + c, async () => {
+      const r = await store.getK('code:' + c); if (!r) return send(res, 404, { err: 'Código incorrecto.' });
+      if (r.exp && Date.now() > r.exp) return send(res, 410, { err: 'Este código ya venció.' });
+      if (r.used.includes(a.u)) return send(res, 409, { err: 'Ya canjeaste este código con tu cuenta.' });
+      if (r.uses && r.used.length >= r.uses) return send(res, 410, { err: 'Este código ya se agotó.' });
+      r.used.push(a.u); await store.setK('code:' + c, r); send(res, 200, { rewards: r.r, note: r.note });
+    });
+  }
   if (p === '/api/me' && m === 'GET') {
     const a = await authed(req, {}); if (!a) return send(res, 401, { err: 'Sesión no válida.' });
     return send(res, 200, { email: a.rec.email ? maskMail(a.rec.email) : '', hasCode: !!a.rec.rc, mail: mailOn() });
